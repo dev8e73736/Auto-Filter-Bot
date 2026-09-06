@@ -142,8 +142,10 @@ async def send_with_visual(bot, caption: str, tmdb_data: Optional[Dict], title: 
     Mirrors the friend's send_with_visual flow:
     get_best_visual() -> a plain image URL (16:9 TMDb backdrop, if we have one)
     -> download it here and send.
-    If TMDb had nothing at all, falls back to the 2:3 custom poster API,
-    and only if THAT also fails, uses the generic default banner image.
+    If TMDb had no backdrop for this title, falls back to the 2:3 custom
+    poster API, then CONVERTS that poster into a proper 16:9 image (blurred
+    background + centered poster) - so the update is ALWAYS 16:9, regardless
+    of whether TMDb happened to have a backdrop for this specific title.
     """
     try:
         visual_url = await get_best_visual(tmdb_data) if tmdb_data else None
@@ -164,11 +166,15 @@ async def send_with_visual(bot, caption: str, tmdb_data: Optional[Dict], title: 
                         )
                         return
                     LOGGER.error(f"Visual URL download failed for '{title}': HTTP {img_resp.status}")
+        else:
+            LOGGER.info(f"No TMDb 16:9 backdrop available for '{title}' - will build one from the poster")
 
-        # TMDb had no 16:9 backdrop at all - try the 2:3 custom poster API.
+        # TMDb had no 16:9 backdrop at all - get the 2:3 poster, then convert it to 16:9.
         poster_bytes = await fetch_custom_poster(title, year)
         if poster_bytes:
-            photo_file = io.BytesIO(poster_bytes)
+            converted = make_16_9_from_poster(poster_bytes)
+            final_bytes = converted if converted else poster_bytes
+            photo_file = io.BytesIO(final_bytes)
             photo_file.name = await generate_random_filename()
             await bot.send_photo(
                 chat_id=MOVIE_UPDATE_CHANNEL,
