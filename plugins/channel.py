@@ -74,12 +74,11 @@ async def send_movie_update(bot, file_name, caption):
         caption = await movie_name_format(caption)
         year_match = re.search(r"\b(19|20)\d{2}\b", caption)
         year = year_match.group(0) if year_match else None      
-        season_match = re.search(r"(?i)(?:s|season)0*(\d{1,2})", caption) or re.search(r"(?i)(?:s|season)0*(\d{1,2})", file_name)
+        season_match_in_name = re.search(r"(?i)(?:s|season)\s*0*(\d{1,2})", file_name)
         if year:
             file_name = file_name[:file_name.find(year) + 4]
-        elif season_match:
-            season = season_match.group(1)
-            file_name = file_name[:file_name.find(season) + 1]
+        elif season_match_in_name:
+            file_name = file_name[:season_match_in_name.start()].strip()
         language = ", ".join([lang for lang in CAPTION_LANGUAGES if lang.lower() in caption.lower()]) or "Multi-Audio"
         if file_name in notified_movies:
             return 
@@ -354,4 +353,3 @@ async def generate_random_filename(extension=".jpg"):
     random_part = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))   
     filename = f"dev_{int(sin_value*10000)}_{random_part}{extension}"
     return filename
-
