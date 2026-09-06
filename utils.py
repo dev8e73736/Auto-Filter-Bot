@@ -19,6 +19,9 @@ from database.users_chats_db import db
 from bs4 import BeautifulSoup
 import requests
 import aiohttp
+from fuzzywuzzy import process
+from PIL import Image, ImageFilter
+from io import BytesIO
 from shortzy import Shortzy
 import http.client
 import json
@@ -280,6 +283,34 @@ async def fetch_tmdb_data(title: str, year: str = None) -> Optional[Dict[str, An
                         matched_endpoint = endpoint
                         break
 
+            # Exact-title search found nothing - the filename may have a typo
+            # (e.g. "Moblan" instead of "Mobland"). Retry with a shortened prefix
+            # of the title (broader net) and fuzzy-match the candidates against
+            # the original title to find the closest real match.
+            if not result:
+                prefix = title.strip()[:5]
+                if len(prefix) >= 3:
+                    for endpoint in ("tv", "movie"):
+                        async with session.get(
+                            f"https://api.themoviedb.org/3/search/{endpoint}",
+                            params={"api_key": TMDB_API_KEY, "query": prefix},
+                            timeout=aiohttp.ClientTimeout(total=15)
+                        ) as resp:
+                            if resp.status != 200:
+                                continue
+                            data = await resp.json(content_type=None)
+                            candidates = data.get("results") or []
+                            if not candidates:
+                                continue
+                            names = [c.get("title") or c.get("name") or "" for c in candidates]
+                            best = process.extractOne(title.strip(), names)
+                            if best and best[1] >= 75:
+                                idx = names.index(best[0])
+                                result = candidates[idx]
+                                matched_endpoint = endpoint
+                                LOGGER.info(f"TMDb fuzzy-match: '{title}' -> '{best[0]}' (score {best[1]}, {endpoint})")
+                                break
+
             if not result or not matched_endpoint:
                 LOGGER.info(f"TMDb API Fetch: no match at all for '{title}'")
                 return None
@@ -389,6 +420,39 @@ async def get_best_visual(tmdb_data: Dict) -> Optional[str]:
     if backdrops.get("all") and backdrops["all"]:
         return backdrops["all"][0]["url"]
     return None
+
+def make_16_9_from_poster(poster_bytes: bytes, size=(1280, 720)) -> Optional[bytes]:
+    """
+    Turns a 2:3 portrait poster into a proper 16:9 image (guaranteed, no
+    dependency on TMDb having a backdrop for this title):
+    a blurred/stretched version of the poster fills the whole 16:9 canvas,
+    and the sharp original poster is centered on top of it.
+    """
+    try:
+        canvas_w, canvas_h = size
+        poster = Image.open(BytesIO(poster_bytes)).convert("RGB")
+
+        # Blurred background: stretch/crop the poster to fill the whole canvas.
+        bg = poster.resize((canvas_w, canvas_h))
+        bg = bg.filter(ImageFilter.GaussianBlur(30))
+        # Darken slightly so the sharp poster on top stands out.
+        bg = Image.eval(bg, lambda px: int(px * 0.6))
+
+        # Foreground: scale the poster to fit the canvas height, keep its aspect ratio.
+        scale = canvas_h / poster.height
+        fg_w, fg_h = int(poster.width * scale), canvas_h
+        fg = poster.resize((fg_w, fg_h))
+
+        canvas = bg.copy()
+        paste_x = (canvas_w - fg_w) // 2
+        canvas.paste(fg, (paste_x, 0))
+
+        out = BytesIO()
+        canvas.save(out, format="JPEG", quality=90)
+        return out.getvalue()
+    except Exception as e:
+        LOGGER.error(f"make_16_9_from_poster failed: {e}")
+        return None
 
 async def search_gagala(text):
     usr_agent = {
