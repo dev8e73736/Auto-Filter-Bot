@@ -6,6 +6,7 @@ from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
 from pyrogram.errors import FloodWait, UserIsBlocked, MessageNotModified, PeerIdInvalid
 from pyrogram import enums
 from typing import Union
+from typing import Dict, Any, Optional
 from Script import script
 import pytz
 import random 
@@ -244,7 +245,151 @@ async def get_poster(query, bulk=False, id=False, file=None):
         'rating': str(movie.get("rating")),
         'url':f'https://www.imdb.com/title/tt{movieid}'
     }
-    
+
+async def fetch_tmdb_data(title: str, year: str = None) -> Optional[Dict[str, Any]]:
+    """
+    Fetches director, genres, rating, and 16:9 backdrop images for a title
+    directly from the official TMDb API (using TMDB_API_KEY from info.py).
+    Returns the SAME dict shape as before, so get_best_visual() and the
+    caller code that reads this dict don't need to change.
+    """
+    if not TMDB_API_KEY:
+        LOGGER.error(f"TMDB_API_KEY is empty/not set - cannot fetch TMDb data for '{title}'")
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            result = None
+            matched_endpoint = None
+            # Try: movie+year -> movie without year (in case the extracted year was wrong) -> tv show.
+            attempts = [("movie", True), ("movie", False), ("tv", False)]
+            for endpoint, use_year in attempts:
+                search_params = {"api_key": TMDB_API_KEY, "query": title.strip()}
+                if use_year and year:
+                    search_params["year"] = str(year)
+                async with session.get(
+                    f"https://api.themoviedb.org/3/search/{endpoint}",
+                    params=search_params,
+                    timeout=aiohttp.ClientTimeout(total=15)
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json(content_type=None)
+                    results = data.get("results") or []
+                    if results:
+                        result = results[0]
+                        matched_endpoint = endpoint
+                        break
+
+            if not result or not matched_endpoint:
+                LOGGER.info(f"TMDb API Fetch: no match at all for '{title}'")
+                return None
+
+            tmdb_id = result.get("id")
+            async with session.get(
+                f"https://api.themoviedb.org/3/{matched_endpoint}/{tmdb_id}",
+                params={"api_key": TMDB_API_KEY, "append_to_response": "credits,images,videos,external_ids"},
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as detail_resp:
+                if detail_resp.status != 200:
+                    LOGGER.error(f"API Fetch Error: TMDb details HTTP {detail_resp.status} for '{title}'")
+                    return None
+                data = await detail_resp.json(content_type=None)
+
+            # Director / creators
+            raw_director = None
+            if matched_endpoint == "movie":
+                crew = (data.get("credits") or {}).get("crew") or []
+                directors = [c.get("name") for c in crew if c.get("job") == "Director"]
+                raw_director = ", ".join(directors[:2]) if directors else None
+            else:
+                creators = data.get("created_by") or []
+                names = [c.get("name") for c in creators if c.get("name")]
+                raw_director = ", ".join(names[:2]) if names else None
+            director = raw_director if raw_director else ""
+
+            IMG_BASE = "https://image.tmdb.org/t/p/original"
+
+            poster_path = data.get("poster_path")
+            poster_url = f"{IMG_BASE}{poster_path}" if poster_path else ""
+            backdrop_path_default = data.get("backdrop_path")
+            backdrop_url = f"{IMG_BASE}{backdrop_path_default}" if backdrop_path_default else ""
+
+            # Group ALL backdrop images by language (matches the shape get_best_visual expects).
+            all_backdrops = (data.get("images") or {}).get("backdrops") or []
+            all_backdrops.sort(key=lambda b: b.get("vote_average", 0), reverse=True)
+            by_language = {}
+            all_list = []
+            for b in all_backdrops:
+                lang = b.get("iso_639_1") or "unknown"
+                entry = {"url": f"{IMG_BASE}{b.get('file_path')}", "vote_average": b.get("vote_average", 0)}
+                by_language.setdefault(lang, []).append(entry)
+                all_list.append(entry)
+
+            posters_list = [
+                {"url": f"{IMG_BASE}{p.get('file_path')}"}
+                for p in (data.get("images") or {}).get("posters", [])
+                if p.get("file_path")
+            ]
+
+            cast_list = [
+                c.get("name") for c in (data.get("credits") or {}).get("cast", [])[:5]
+                if c.get("name")
+            ]
+
+            videos_list = []
+            for v in (data.get("videos") or {}).get("results", []):
+                if v.get("site") == "YouTube":
+                    videos_list.append({"url": f"https://www.youtube.com/watch?v={v.get('key')}", "type": v.get("type")})
+
+            imdb_id = (data.get("external_ids") or {}).get("imdb_id") or ""
+
+            return {
+                "id": tmdb_id,
+                "title": data.get("title") or data.get("name") or title,
+                "original_title": data.get("original_title") or data.get("original_name") or "",
+                "original_language": data.get("original_language", "en"),
+                "kind": "MOVIE" if matched_endpoint == "movie" else "TV",
+                "director": director,
+                "release_date": data.get("release_date") or data.get("first_air_date") or "",
+                "vote_average": f"{data['vote_average']:.1f}" if data.get("vote_average") else "N/A",
+                "vote_count": f"{data['vote_count']:,}" if data.get("vote_count") else "0",
+                "genres": [g.get("name") for g in (data.get("genres") or []) if g.get("name")],
+                "imdb_id": imdb_id,
+                "imdb_url": f"https://www.imdb.com/title/{imdb_id}/" if imdb_id else "",
+                "overview": data.get("overview", ""),
+                "poster_url": poster_url,
+                "backdrop_url": backdrop_url,
+                "backdrops": {"by_language": by_language, "all": all_list},
+                "posters": posters_list,
+                "cast": cast_list,
+                "videos": videos_list,
+            }
+
+    except Exception as e:
+        LOGGER.error(f"API Fetch Error: {str(e)}")
+        return None
+
+async def get_best_visual(tmdb_data: Dict) -> Optional[str]:
+    backdrops = tmdb_data.get("backdrops", {})
+    by_language = backdrops.get("by_language", {})    
+    original_lang = tmdb_data.get("original_language")
+    if original_lang and by_language.get(original_lang):
+        return by_language[original_lang][0]["url"]    
+    indian_langs = [
+        "hi", "ta", "te", "kn", "ml", "mr", "bn", "gu", "pa", "or", "as", 
+        "ur", "ne"
+    ]
+    for lang in indian_langs:
+        if by_language.get(lang):
+            return by_language[lang][0]["url"]    
+    if by_language.get("en"):
+        return by_language["en"][0]["url"]
+    if by_language.get("unknown"):
+        return by_language["unknown"][0]["url"]    
+    if backdrops.get("all") and backdrops["all"]:
+        return backdrops["all"][0]["url"]
+    return None
+
 async def search_gagala(text):
     usr_agent = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
