@@ -147,7 +147,7 @@ async def send_with_visual(bot, caption: str, tmdb_data: Optional[Dict], title: 
     and only if THAT also fails, uses the generic default banner image.
     """
     try:
-        visual_url = get_best_visual(tmdb_data)
+        visual_url = await get_best_visual(tmdb_data) if tmdb_data else None
 
         if visual_url:
             async with aiohttp.ClientSession() as session:
@@ -190,15 +190,6 @@ async def send_with_visual(bot, caption: str, tmdb_data: Optional[Dict], title: 
         )
     except Exception as e:
         LOGGER.error(f"Visual Send Error: {e}")
-
-def get_best_visual(tmdb_data: Optional[Dict]) -> Optional[str]:
-    """Returns the full 16:9 TMDb backdrop image URL, or None if we have no TMDb data."""
-    if not tmdb_data:
-        return None
-    backdrop_path = tmdb_data.get("backdrop_path")
-    if not backdrop_path:
-        return None
-    return f"https://image.tmdb.org/t/p/original{backdrop_path}"
 
 @Client.on_callback_query(filters.regex(r"^r_"))
 async def reaction_handler(client, query):
@@ -251,109 +242,6 @@ async def get_imdb_details(name):
     except Exception as e:
         LOGGER.error(f"IMDB fetch error: {e}")
         return {}
-
-async def fetch_tmdb_data(title: str, year: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """
-    Searches TMDb for this title (movie first, then TV series) and returns a dict with
-    everything needed for the update caption: title, kind, release_date, rating,
-    genres, director - plus backdrop_path (a TMDb file path string, NOT downloaded
-    bytes - get_best_visual() turns this into the full image URL).
-    Returns None if TMDb has no match at all for this title.
-    """
-    if not TMDB_API_KEY:
-        LOGGER.error(f"TMDB_API_KEY is empty/not set - skipping TMDb lookup for '{title}'")
-        return None
-    try:
-        async with aiohttp.ClientSession() as session:
-            result = None
-            matched_endpoint = None
-            # Try: movie+year -> movie without year (in case the extracted year was wrong) -> tv show.
-            attempts = [("movie", True), ("movie", False), ("tv", False)]
-            for endpoint, use_year in attempts:
-                search_params = {"api_key": TMDB_API_KEY, "query": title.strip()}
-                if use_year and year is not None:
-                    search_params["year"] = str(year)
-                async with session.get(
-                    f"https://api.themoviedb.org/3/search/{endpoint}",
-                    params=search_params,
-                    timeout=aiohttp.ClientTimeout(total=15)
-                ) as resp:
-                    if resp.status != 200:
-                        LOGGER.error(f"TMDb search ({endpoint}, year={use_year}) failed for '{title}': HTTP {resp.status}")
-                        continue
-                    data = await resp.json(content_type=None)
-                    results = data.get("results") or []
-                    if results:
-                        result = results[0]
-                        matched_endpoint = endpoint
-                        break
-                    else:
-                        LOGGER.info(f"TMDb search ({endpoint}, year={use_year}) found no results for '{title}'")
-
-            if not result or not matched_endpoint:
-                LOGGER.info(f"TMDb has no match at all for '{title}' - falling back to IMDb + custom poster API")
-                return None
-
-            tmdb_id = result.get("id")
-
-            # One combined call: full details + cast/crew (for director) + all images (for backdrop).
-            async with session.get(
-                f"https://api.themoviedb.org/3/{matched_endpoint}/{tmdb_id}",
-                params={"api_key": TMDB_API_KEY, "append_to_response": "credits,images"},
-                timeout=aiohttp.ClientTimeout(total=15)
-            ) as detail_resp:
-                if detail_resp.status != 200:
-                    LOGGER.error(f"TMDb details fetch failed for '{title}' (id={tmdb_id}): HTTP {detail_resp.status}")
-                    return None
-                details = await detail_resp.json(content_type=None)
-
-            movie_title = details.get("title") or details.get("name") or title
-            kind = "MOVIE" if matched_endpoint == "movie" else "TV_SERIES"
-            release_date = details.get("release_date") or details.get("first_air_date") or ""
-            vote_average = round(details.get("vote_average", 0) or 0, 1)
-            vote_count = details.get("vote_count", 0) or 0
-            genres = [g.get("name") for g in (details.get("genres") or []) if g.get("name")]
-
-            director = ""
-            if matched_endpoint == "movie":
-                crew = (details.get("credits") or {}).get("crew") or []
-                directors = [c.get("name") for c in crew if c.get("job") == "Director"]
-                director = ", ".join(directors[:2])
-            else:
-                creators = details.get("created_by") or []
-                director = ", ".join([c.get("name") for c in creators if c.get("name")][:2])
-
-            # Pick the best-rated 16:9 backdrop from the FULL image list (much more
-            # reliable than the single 'backdrop_path' field, which is often empty).
-            backdrop_path = None
-            backdrops = (details.get("images") or {}).get("backdrops") or []
-            if backdrops:
-                backdrops.sort(key=lambda b: b.get("vote_average", 0), reverse=True)
-                backdrop_path = backdrops[0].get("file_path")
-            if not backdrop_path:
-                backdrop_path = details.get("backdrop_path")
-
-            if not backdrop_path:
-                LOGGER.info(f"TMDb matched '{title}' but has no 16:9 backdrop at all")
-
-            return {
-                "title": movie_title,
-                "kind": kind,
-                "release_date": release_date,
-                "vote_average": vote_average,
-                "vote_count": vote_count,
-                "genres": genres,
-                "director": director,
-                "backdrop_path": backdrop_path,
-            }
-    except aiohttp.ClientError as e:
-        LOGGER.error(f"TMDb network error for '{title}': {str(e)}")
-    except asyncio.TimeoutError:
-        LOGGER.error(f"TMDb request timed out for '{title}'")
-    except Exception as e:
-        LOGGER.error(f"TMDb unexpected error for '{title}': {str(e)}")
-    return None
-
 
 async def fetch_custom_poster(title: str, year: Optional[str] = None) -> Optional[bytes]:
     base_url = "https://black-bonus-46d1.parikgovind45.workers.dev/api/v2/poster"
@@ -466,3 +354,4 @@ async def generate_random_filename(extension=".jpg"):
     random_part = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))   
     filename = f"dev_{int(sin_value*10000)}_{random_part}{extension}"
     return filename
+
